@@ -1,0 +1,46 @@
+# Environment & secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Logs & data
+logs/
+*.log
+db/
+models/*.pkl
+models/*.json
+models/*.pt
+*.parquet
+*.csv
+
+# Node / Web
+node_modules/
+web/dist/
+mobile/node_modules/
+mobile/.expo/
+mobile/android/
+mobile/ios/
+*.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Docker volumes
+redis_data/
+pg_data/
