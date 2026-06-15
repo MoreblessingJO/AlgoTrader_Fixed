@@ -12,6 +12,7 @@ from typing import Optional
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import MODE, RISK
+from execution.trade_journal import TradeJournal
 
 log = logging.getLogger("Broker")
 
@@ -109,6 +110,7 @@ class Broker:
         self.oanda       = oanda_feed
         self.risk        = risk_engine
         self._orders: list[Order] = []
+        self.journal     = TradeJournal(mode=self.mode)
 
     # ── Place order ───────────────────────────────────────────────
 
@@ -133,6 +135,7 @@ class Broker:
 
         if order.status == "OPEN":
             self._orders.append(order)
+            self.journal.record_open(order)
             if self.risk:
                 self.risk.record_trade_open({
                     "id": order.id, "symbol": order.symbol,
@@ -171,6 +174,7 @@ class Broker:
 
         if self.risk:
             self.risk.record_trade_close(order.id, pnl)
+        self.journal.record_close(order)
 
         sign = "+" if pnl >= 0 else ""
         log.info(
