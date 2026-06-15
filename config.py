@@ -59,16 +59,17 @@ CRYPTO_SYMBOLS = [
 ]
 
 CRASH_BOOM_SYMBOLS = [
-    ("BOOM300N",   300, "up"),
-    ("BOOM500",    500, "up"),
-    ("BOOM600",    600, "up"),
-    ("BOOM900",    900, "up"),
-    ("BOOM1000",  1000, "up"),
-    ("CRASH300N",  300, "down"),
-    ("CRASH500",   500, "down"),
-    ("CRASH600",   600, "down"),
-    ("CRASH900",   900, "down"),
-    ("CRASH1000", 1000, "down"),
+    # (symbol, avg_ticks_between_spikes, direction, typical_spike_magnitude)
+    ("BOOM300N",   300, "up",    15.0),
+    ("BOOM500",    500, "up",    25.0),
+    ("BOOM600",    600, "up",    30.0),
+    ("BOOM900",    900, "up",    45.0),
+    ("BOOM1000",  1000, "up",    60.0),
+    ("CRASH300N",  300, "down",  15.0),
+    ("CRASH500",   500, "down",  25.0),
+    ("CRASH600",   600, "down",  30.0),
+    ("CRASH900",   900, "down",  45.0),
+    ("CRASH1000", 1000, "down",  60.0),
 ]
 
 FOREX_PAIRS = [
@@ -84,7 +85,7 @@ FOREX_PAIRS = [
 class RiskConfig:
     risk_per_trade_pct: float   = 0.02     # 2% of balance per trade
     max_open_per_market: int    = 3        # max concurrent positions per market
-    max_open_total: int         = 15        # hard cap across all markets
+    max_open_total: int         = 15       # hard cap across all markets
     daily_loss_limit_pct: float = 0.06     # 6% daily loss → halt all trading
     max_drawdown_pct: float     = 0.15     # 15% drawdown → emergency stop
     min_rr_ratio: float         = 1.5      # minimum reward:risk to take a trade
@@ -118,30 +119,34 @@ class CrashBoomConfig:
     s1_geometric_prob_threshold: float  = 0.70
     s1_compression_threshold: float     = 0.40
     s1_tssl_threshold: float            = 0.50
-    s1_tp_atr_mult: float               = 3.0
-    s1_sl_atr_mult: float               = 1.0
+    # TP/SL expressed as fraction of the symbol's typical_spike_magnitude.
+    # e.g. for BOOM500 (spike=25pts): TP = 25×1.0 = 25pts, SL = 25×0.45 = 11.25pts
+    s1_tp_spike_frac: float             = 1.0   # target = full spike magnitude
+    s1_sl_spike_frac: float             = 0.45  # stop = 45% of spike mag (2.2:1 RR)
 
     # CB-S2: Compression trend rider
     s2_ema_fast: int                    = 9
     s2_ema_slow: int                    = 21
     s2_compression_max: float           = 0.55
-    s2_tp_atr_mult: float               = 2.5
-    s2_sl_atr_mult: float               = 1.2
+    s2_tp_spike_frac: float             = 0.80  # TP = 80% of spike mag
+    s2_sl_spike_frac: float             = 0.50  # SL = 50% of spike mag (1.6:1 RR)
 
-    # CB-S3: Kingpin divergence + reversal
+    # CB-S3: Kingpin divergence + reversal (already uses fixed pts — correct approach)
     s3_h4_rsi_extreme_low: float        = 32.0
     s3_h4_rsi_extreme_high: float       = 68.0
     s3_scalper_tp_pts: float            = 85.0
     s3_runner_trail_pts: float          = 135.0
     s3_scalper_sl_pts: float            = 25.0
 
-    # CB-S4: Sniper exhaustion (standalone — minimal changes)
-    s4_h4_rsi_low: float                = 30.0
-    s4_h4_rsi_high: float               = 70.0
-    s4_h1_streak_min: int               = 4
-    s4_m5_rsi_exhaust_low: float        = 28.0
-    s4_m5_rsi_exhaust_high: float       = 72.0
-    s4_trail_pts: float                 = 20.0
+    # CB-S4: Sniper exhaustion
+    s4_h4_rsi_low: float                = 25.0
+    s4_h4_rsi_high: float               = 75.0
+    s4_h1_streak_min: int               = 6
+    s4_m5_rsi_exhaust_low: float        = 22.0
+    s4_m5_rsi_exhaust_high: float       = 78.0
+    s4_tp_spike_frac: float             = 1.5   # TP = 1.5× spike mag (runner play)
+    s4_sl_spike_frac: float             = 0.45  # SL = 45% of spike mag
+    s4_trail_spike_frac: float          = 0.30  # trailing stop = 30% of spike mag
 
 CB = CrashBoomConfig()
 
@@ -244,7 +249,7 @@ STRATEGY_WEIGHTS = {
     "CR-S2": 0.68,
 }
 
-CONSENSUS_THRESHOLD = 0.60     # minimum weighted score to execute
+CONSENSUS_THRESHOLD = 0.65     # minimum weighted score to execute
 
 # ══════════════════════════════════════════════════════
 #  Performance monitoring

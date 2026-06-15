@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from collections import deque
+from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -17,9 +18,11 @@ from config import DERIV_APP_ID, CRASH_BOOM_SYMBOLS
 
 logger = logging.getLogger(__name__)
 
-DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+DERIV_WS_URL  = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+TICK_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "ticks")
+TICK_LOG_INTERVAL = 300   # flush to CSV every 5 minutes
 # All symbols from config (just the symbol string from each tuple)
-_DEFAULT_SYMBOLS = [sym for sym, _, _ in CRASH_BOOM_SYMBOLS]
+_DEFAULT_SYMBOLS = [sym for sym, *_ in CRASH_BOOM_SYMBOLS]
 RECONNECT_DELAY = 5
 
 # Spike-detection: price change must exceed this multiple of rolling avg to count
@@ -45,8 +48,11 @@ class DerivFeed:
 
         # direction lookup built from config: symbol -> "up" | "down"
         self._direction: Dict[str, str] = {
-            sym: direction for sym, _, direction in CRASH_BOOM_SYMBOLS
+            sym: direction for sym, _, direction, *_ in CRASH_BOOM_SYMBOLS
         }
+
+        # last epoch (float) written to CSV per symbol — avoids re-writing duplicates
+        self._last_saved_epoch: Dict[str, float] = {sym: 0.0 for sym in self.symbols}
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -220,3 +226,50 @@ class DerivFeed:
     @property
     def is_running(self) -> bool:
         return self._running
+
+    # ── Live tick persistence ─────────────────────────────────────────
+
+    async def tick_logger(self, interval: int = TICK_LOG_INTERVAL):
+        """
+        Coroutine that runs alongside the stream loop.
+        Every `interval` seconds it appends any new ticks received since
+        the last flush to data/ticks/<SYMBOL>_ticks.csv.
+        These CSVs are the same format DataLoader.load_csv() expects,
+        so models/retrain_real.py --skip-fetch can retrain on them directly.
+        """
+        os.makedirs(TICK_DATA_DIR, exist_ok=True)
+        logger.info(f"TickLogger: will flush every {interval}s → {TICK_DATA_DIR}")
+
+        while self._running:
+            await asyncio.sleep(interval)
+            total_new = 0
+            for symbol in self.symbols:
+                buf = self._ticks.get(symbol)
+                if not buf:
+                    continue
+
+                # Snapshot deque and filter to ticks we haven't saved yet
+                ticks = list(buf)
+                cutoff = self._last_saved_epoch.get(symbol, 0.0)
+                new_ticks = [(ep, pr) for ep, pr in ticks if ep > cutoff]
+                if not new_ticks:
+                    continue
+
+                csv_path = os.path.join(TICK_DATA_DIR, f"{symbol}_ticks.csv")
+                write_header = not os.path.exists(csv_path)
+
+                rows = pd.DataFrame({
+                    "timestamp": [
+                        datetime.fromtimestamp(ep, tz=timezone.utc)
+                              .strftime("%Y-%m-%d %H:%M:%S")
+                        for ep, _ in new_ticks
+                    ],
+                    "price": [pr for _, pr in new_ticks],
+                })
+                rows.to_csv(csv_path, mode="a", header=write_header, index=False)
+
+                self._last_saved_epoch[symbol] = new_ticks[-1][0]
+                total_new += len(new_ticks)
+
+            if total_new:
+                logger.info(f"TickLogger: flushed {total_new} new ticks across {len(self.symbols)} symbols")

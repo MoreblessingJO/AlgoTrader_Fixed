@@ -45,6 +45,7 @@ from monitor.telegram   import (
     alert_circuit_breaker, alert_divergence, send_daily_report
 )
 from api.server import app as _api_app, inject_bot
+from models.cb_predictor import CBPredictorPool
 
 # ── Logging ───────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -89,6 +90,21 @@ def bb_width(series: pd.Series, period: int = 20, std_dev: float = 2.0) -> pd.Se
     upper = mid + std_dev * std
     lower = mid - std_dev * std
     return (upper - lower) / mid.replace(0, np.nan)
+
+def bb_pct_b(series: pd.Series, period: int = 20, std_dev: float = 2.0) -> pd.Series:
+    mid   = series.rolling(period, min_periods=1).mean()
+    std   = series.rolling(period, min_periods=1).std().fillna(0)
+    upper = mid + std_dev * std
+    lower = mid - std_dev * std
+    return (series - lower) / (upper - lower).replace(0, np.nan)
+
+def macd_hist_norm(series: pd.Series, atr_s: pd.Series,
+                   fast: int = 9, slow: int = 21, sig: int = 9) -> pd.Series:
+    ema_f = series.ewm(span=fast, adjust=False).mean()
+    ema_s = series.ewm(span=slow, adjust=False).mean()
+    macd  = ema_f - ema_s
+    signal = macd.ewm(span=sig, adjust=False).mean()
+    return (macd - signal) / (atr_s + 1e-9)
 
 def compression_ratio(atr_s: pd.Series, bbw: pd.Series, period: int = 20) -> pd.Series:
     def _norm(s):
@@ -178,6 +194,14 @@ class TradingBot:
         )
         self.consensus = ConsensusEngine(broker=self.broker)
 
+        # ML predictors (loaded if models exist, None otherwise → rule-based fallback)
+        self._cb_models = CBPredictorPool()
+        self._cb_models.load_all([sym for sym, *_ in CRASH_BOOM_SYMBOLS])
+        if len(self._cb_models):
+            log.info(f"ML models active for CB: {len(self._cb_models)} symbols")
+        else:
+            log.info("No CB ML models found — running rule-based signals only")
+
         # State
         self._last_daily_report = datetime.now(timezone.utc).date()
         self._strategy_stats: dict[str, dict] = {}
@@ -195,6 +219,7 @@ class TradingBot:
         await asyncio.gather(
             self.binance.stream(CRYPTO_SYMBOLS),
             self.deriv.stream(),
+            self.deriv.tick_logger(),       # persists live ticks to CSV every 5 min
             self.oanda.poll_prices(interval=3),
             self._crypto_loop(),
             self._crash_boom_loop(),
@@ -205,13 +230,19 @@ class TradingBot:
         )
 
     async def _api_server(self):
-        config = uvicorn.Config(
-            _api_app, host="0.0.0.0", port=8081,
-            log_level="warning", access_log=False,
-        )
-        server = uvicorn.Server(config)
-        log.info("API server starting on :8081")
-        await server.serve()
+        for port in (8081, 8082, 8083):
+            try:
+                config = uvicorn.Config(
+                    _api_app, host="0.0.0.0", port=port,
+                    log_level="warning", access_log=False,
+                )
+                server = uvicorn.Server(config)
+                log.info(f"API server starting on :{port}")
+                await server.serve()
+                return
+            except (SystemExit, OSError) as e:
+                log.warning(f"API server failed on port {port}: {e} — trying next port")
+        log.error("API server could not bind to any port — dashboard unavailable, trading continues")
 
     # ══════════════════════════════════════════════════════════════
     #  Market loops
@@ -231,8 +262,8 @@ class TradingBot:
         log.info("Crash/Boom loop started")
         while self._running:
             try:
-                for sym, avg_ticks, direction in CRASH_BOOM_SYMBOLS:
-                    await self._eval_crash_boom(sym, avg_ticks, direction)
+                for sym, avg_ticks, direction, spike_mag in CRASH_BOOM_SYMBOLS:
+                    await self._eval_crash_boom(sym, avg_ticks, direction, spike_mag)
             except Exception as e:
                 log.error(f"CB loop error: {e}", exc_info=True)
             await asyncio.sleep(30)
@@ -371,7 +402,7 @@ class TradingBot:
     #  Signal evaluation — Crash/Boom (V4 + V21 + Sniper)
     # ══════════════════════════════════════════════════════════════
 
-    async def _eval_crash_boom(self, symbol: str, avg_ticks: int, direction: str):
+    async def _eval_crash_boom(self, symbol: str, avg_ticks: int, direction: str, spike_mag: float):
         if len(self.broker.open_for_symbol(symbol)) >= 2:
             return
 
@@ -389,22 +420,25 @@ class TradingBot:
         close = candles_m1["close"]
         high  = candles_m1["high"]
         low   = candles_m1["low"]
+        open_ = candles_m1.get("open", close.shift(1).fillna(close))
 
-        atr_v    = atr(high, low, close, 14).iloc[-1]
+        atr_s    = atr(high, low, close, 14)
+        atr_v    = atr_s.iloc[-1]
         rsi14    = rsi(close, 14)
         rsi_v    = rsi14.iloc[-1]
+        rsi7_v   = rsi(close, 7).iloc[-1]
         bbw      = bb_width(close, 20)
-        atr_s    = atr(high, low, close, 14)
+        pct_b_v  = bb_pct_b(close, 20).iloc[-1]
         comp     = compression_ratio(atr_s, bbw).iloc[-1]
         ema9_v   = ema(close, 9).iloc[-1]
         ema21_v  = ema(close, 21).iloc[-1]
+        ema50_v  = ema(close, 50).iloc[-1]
+        macd_v   = macd_hist_norm(close, atr_s).iloc[-1]
+        div      = rsi_divergence(close, rsi14, 20).iloc[-1]
 
-        # Tick stream features
         tick_changes = close.diff().dropna()
         tssl_v = tssl(tick_changes, 50)
 
-        # H1 candles (built from M1 by aggregation)
-        # Approximate from M1: take last 60 M1 bars
         if len(candles_m1) >= 60:
             h1_slice  = candles_m1.tail(60)
             h1_rsi    = rsi(h1_slice["close"], 14).iloc[-1]
@@ -419,8 +453,34 @@ class TradingBot:
             h1_rsi    = rsi_v
             h1_streak = 0
 
+        geo_prob         = 1 - (1 - 1/avg_ticks) ** min(ticks_since, avg_ticks * 5)
+        ema_spread       = (ema9_v - ema21_v) / max(atr_v, 1e-9)
+        price_ema50_dist = (price - ema50_v) / max(atr_v, 1e-9)
+
+        # ── ML model prediction (None if model not trained yet) ───
+        ml_conf = self._cb_models.predict(
+            symbol,
+            geo_prob         = geo_prob,
+            compression      = comp,
+            tssl             = tssl_v,
+            rsi14            = rsi_v,
+            rsi7             = rsi7_v,
+            ema_spread       = ema_spread,
+            atr_pct          = atr_v / max(price, 1e-9),
+            bb_width         = bbw.iloc[-1],
+            bb_pct_b         = float(pct_b_v) if not np.isnan(pct_b_v) else 0.5,
+            h1_rsi           = h1_rsi,
+            h1_streak        = h1_streak,
+            price_ema50_dist = price_ema50_dist,
+            rsi_div          = float(div),
+            macd_hist        = float(macd_v) if not np.isnan(macd_v) else 0.0,
+        )
+
+        # If ML model available and says no spike coming, skip all CB signals
+        if ml_conf is not None and ml_conf < 0.40:
+            return
+
         # ── V4 Brain: CB-S1 Apex Compression Spike Hunter ────────
-        geo_prob = 1 - (1 - 1/avg_ticks) ** min(ticks_since, avg_ticks * 5)
         v4_lights = [
             geo_prob    >= CB.s1_geometric_prob_threshold,
             comp        <= CB.s1_compression_threshold,
@@ -430,45 +490,49 @@ class TradingBot:
 
         if all(v4_lights):
             trade_dir = "BUY" if direction == "up" else "SELL"
-            sl = price - atr_v * CB.s1_sl_atr_mult if trade_dir == "BUY" else price + atr_v * CB.s1_sl_atr_mult
-            tp = price + atr_v * CB.s1_tp_atr_mult if trade_dir == "BUY" else price - atr_v * CB.s1_tp_atr_mult
+            sl = price - spike_mag * CB.s1_sl_spike_frac if trade_dir == "BUY" else price + spike_mag * CB.s1_sl_spike_frac
+            tp = price + spike_mag * CB.s1_tp_spike_frac if trade_dir == "BUY" else price - spike_mag * CB.s1_tp_spike_frac
+            # Blend rule-based geo_prob with ML confidence when available
+            s1_conf = round((geo_prob * 0.4 + ml_conf * 0.6), 3) if ml_conf is not None else geo_prob
             await self._fire_signal(Signal(
                 brain="v4", strategy="CB-S1", market="crash_boom",
                 symbol=symbol, direction=trade_dir,
-                confidence=geo_prob, entry_price=price, sl=sl, tp=tp,
-                metadata={"geo_prob": round(geo_prob, 3), "compression": round(comp, 3), "tssl": round(tssl_v, 3)},
+                confidence=min(s1_conf, 0.97), entry_price=price, sl=sl, tp=tp,
+                metadata={"geo_prob": round(geo_prob,3), "compression": round(comp,3),
+                          "tssl": round(tssl_v,3), "ml_conf": round(ml_conf,3) if ml_conf else None},
             ))
 
         # ── V4 Brain: CB-S2 Compression Trend Rider ──────────────
         if comp < CB.s2_compression_max:
-            # Dynamic confidence: tighter compression + wider EMA spread = stronger signal
             _comp_q  = (CB.s2_compression_max - comp) / CB.s2_compression_max
             _ema_q   = min(abs(ema9_v - ema21_v) / max(atr_v, 1e-9), 1.0)
-            _s2_conf = round(min(0.97, 0.70 + 0.27 * (_comp_q * 0.55 + _ema_q * 0.45)), 3)
+            _rule_conf = round(min(0.97, 0.70 + 0.27 * (_comp_q * 0.55 + _ema_q * 0.45)), 3)
+            _s2_conf = round((_rule_conf * 0.4 + ml_conf * 0.6), 3) if ml_conf is not None else _rule_conf
+            _s2_conf = min(_s2_conf, 0.97)
             if ema9_v > ema21_v and direction == "up":
-                sl = price - atr_v * CB.s2_sl_atr_mult
-                tp = price + atr_v * CB.s2_tp_atr_mult
+                sl = price - spike_mag * CB.s2_sl_spike_frac
+                tp = price + spike_mag * CB.s2_tp_spike_frac
                 await self._fire_signal(Signal(
                     brain="v4", strategy="CB-S2", market="crash_boom",
                     symbol=symbol, direction="BUY",
                     confidence=_s2_conf, entry_price=price, sl=sl, tp=tp,
+                    metadata={"ml_conf": round(ml_conf,3) if ml_conf else None},
                 ))
             elif ema9_v < ema21_v and direction == "down":
-                sl = price + atr_v * CB.s2_sl_atr_mult
-                tp = price - atr_v * CB.s2_tp_atr_mult
+                sl = price + spike_mag * CB.s2_sl_spike_frac
+                tp = price - spike_mag * CB.s2_tp_spike_frac
                 await self._fire_signal(Signal(
                     brain="v4", strategy="CB-S2", market="crash_boom",
                     symbol=symbol, direction="SELL",
                     confidence=_s2_conf, entry_price=price, sl=sl, tp=tp,
+                    metadata={"ml_conf": round(ml_conf,3) if ml_conf else None},
                 ))
 
         # ── V21 Brain: CB-S3 Kingpin Divergence + Reversal ───────
-        div = rsi_divergence(close, rsi14, 20).iloc[-1]
         h4_extreme = h1_rsi < CB.s3_h4_rsi_extreme_low or h1_rsi > CB.s3_h4_rsi_extreme_high
 
         if div != 0 and h4_extreme:
             trade_dir = "BUY" if div > 0 else "SELL"
-            # Dynamic confidence: deeper RSI extreme = stronger reversal conviction
             _rsi_depth = (
                 (CB.s3_h4_rsi_extreme_low - h1_rsi) / max(CB.s3_h4_rsi_extreme_low, 1)
                 if h1_rsi < 50
@@ -476,7 +540,6 @@ class TradingBot:
             )
             _rsi_depth = max(0.0, min(1.0, _rsi_depth))
             _s3_conf   = round(min(0.97, 0.78 + 0.18 * _rsi_depth), 3)
-            # Scalper lot
             sl_pts = CB.s3_scalper_sl_pts
             sl  = price - sl_pts if trade_dir == "BUY" else price + sl_pts
             tp  = price + CB.s3_scalper_tp_pts if trade_dir == "BUY" else price - CB.s3_scalper_tp_pts
@@ -485,9 +548,8 @@ class TradingBot:
                 symbol=symbol, direction=trade_dir,
                 confidence=_s3_conf, entry_price=price, sl=sl, tp=tp,
                 lot="scalper",
-                metadata={"divergence": div, "h1_rsi": round(h1_rsi, 1), "conf": _s3_conf},
+                metadata={"divergence": div, "h1_rsi": round(h1_rsi, 1)},
             ))
-            # Runner lot
             tp2 = price + CB.s3_runner_trail_pts if trade_dir == "BUY" else price - CB.s3_runner_trail_pts
             await self._fire_signal(Signal(
                 brain="v21", strategy="CB-S3", market="crash_boom",
@@ -495,28 +557,34 @@ class TradingBot:
                 confidence=_s3_conf, entry_price=price, sl=sl, tp=tp2,
                 trailing_pts=CB.s3_runner_trail_pts,
                 lot="runner",
-                metadata={"divergence": div, "conf": _s3_conf},
+                metadata={"divergence": div},
             ))
 
         # ── Sniper Brain: CB-S4 M5 Exhaustion ────────────────────
-        m5_rsi_v = rsi_v    # using M1 RSI as M5 proxy
+        m5_rsi_v          = rsi_v
         h4_extreme_sniper = h1_rsi < CB.s4_h4_rsi_low or h1_rsi > CB.s4_h4_rsi_high
         h1_streak_ok      = h1_streak >= CB.s4_h1_streak_min
         m5_exhaust        = (
             (m5_rsi_v < CB.s4_m5_rsi_exhaust_low  and direction == "up")  or
             (m5_rsi_v > CB.s4_m5_rsi_exhaust_high and direction == "down")
         )
+        # ML gate: if model active, require it to agree (>= 0.55) before firing sniper
+        ml_gate_ok = (ml_conf is None) or (ml_conf >= 0.55)
 
-        if h4_extreme_sniper and h1_streak_ok and m5_exhaust:
-            trade_dir = "BUY" if direction == "up" else "SELL"
-            sl = price - CB.s4_trail_pts * 2 if trade_dir == "BUY" else price + CB.s4_trail_pts * 2
-            tp = price + CB.s4_trail_pts * 5 if trade_dir == "BUY" else price - CB.s4_trail_pts * 5
+        if h4_extreme_sniper and h1_streak_ok and m5_exhaust and ml_gate_ok:
+            trade_dir  = "BUY" if direction == "up" else "SELL"
+            sl_dist    = spike_mag * CB.s4_sl_spike_frac
+            trail_dist = spike_mag * CB.s4_trail_spike_frac
+            sl = price - sl_dist if trade_dir == "BUY" else price + sl_dist
+            tp = price + spike_mag * CB.s4_tp_spike_frac if trade_dir == "BUY" else price - spike_mag * CB.s4_tp_spike_frac
+            s4_conf = round((0.90 * 0.4 + ml_conf * 0.6), 3) if ml_conf is not None else 0.90
             await self._fire_signal(Signal(
                 brain="sniper", strategy="CB-S4", market="crash_boom",
                 symbol=symbol, direction=trade_dir,
-                confidence=0.95, entry_price=price, sl=sl, tp=tp,
-                trailing_pts=CB.s4_trail_pts,
-                metadata={"h1_streak": h1_streak, "m5_rsi": round(m5_rsi_v, 1)},
+                confidence=min(s4_conf, 0.97), entry_price=price, sl=sl, tp=tp,
+                trailing_pts=trail_dist,
+                metadata={"h1_streak": h1_streak, "m5_rsi": round(m5_rsi_v,1),
+                          "ml_conf": round(ml_conf,3) if ml_conf else None},
             ))
 
     # ══════════════════════════════════════════════════════════════

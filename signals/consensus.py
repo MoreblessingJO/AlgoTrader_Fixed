@@ -55,8 +55,13 @@ class ConsensusEngine:
         Submit a signal for consensus evaluation.
         Returns the approved signal or None if blocked.
         """
-        # Sniper always executes immediately — bypass consensus
+        # Sniper gets priority but still requires minimum confidence
         if signal.brain == "sniper":
+            weight = STRATEGY_WEIGHTS.get(signal.strategy, 0.96)
+            weighted_score = signal.confidence * weight
+            if weighted_score < CONSENSUS_THRESHOLD:
+                log.debug(f"Sniper below threshold: score={weighted_score:.2f}")
+                return None
             log.info(f"SNIPER PRIORITY: {signal.strategy} {signal.direction} {signal.symbol}")
             return signal
 
