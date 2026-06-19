@@ -239,7 +239,7 @@ CR = CryptoConfig()
 STRATEGY_WEIGHTS = {
     "CB-S1": 0.83,
     "CB-S2": 0.81,
-    "CB-S3": 0.92,
+    "CB-S3": 0.0,   # disabled — 100% loss rate in paper trading
     "CB-S4": 0.96,
     "FX-S1": 0.71,
     "FX-S2": 0.76,

@@ -485,6 +485,67 @@ async def websocket_endpoint(ws: WebSocket, token: Optional[str] = None):
         manager.disconnect(ws)
 
 
+
+@app.get("/api/strategy-growth")
+async def strategy_growth(user: str = Depends(verify_token)):
+    import csv as _csv
+    from pathlib import Path
+    base = Path(__file__).parent.parent
+    out = {
+        "strategy_daily": {},
+        "auc_series": [],
+        "breakeven": {"CB-S1": 31.0, "CB-S2": 38.5, "CB-S4": 23.3},
+    }
+    journal = base / "logs" / "trade_journal.csv"
+    if journal.exists():
+        daily = {}
+        with open(journal, newline="") as f:
+            for row in _csv.DictReader(f):
+                ct = row.get("closed_at", "")
+                if not ct:
+                    continue
+                date = ct[:10]
+                strat = row.get("strategy", "?")
+                try:
+                    pnl = float(row.get("pnl_usd", 0))
+                except Exception:
+                    continue
+                daily.setdefault(strat, {}).setdefault(date, {"wins": 0, "total": 0, "pnl": 0.0})
+                daily[strat][date]["total"] += 1
+                if row.get("result", "") == "WIN":
+                    daily[strat][date]["wins"] += 1
+                daily[strat][date]["pnl"] += pnl
+        for strat, dates in daily.items():
+            out["strategy_daily"][strat] = {
+                d: {
+                    "wr": round(v["wins"] / v["total"] * 100, 1) if v["total"] else 0,
+                    "trades": v["total"],
+                    "pnl": round(v["pnl"], 2),
+                }
+                for d, v in sorted(dates.items())
+            }
+    model_hist = base / "logs" / "model_history.csv"
+    if model_hist.exists():
+        auc_by_date: dict = {}
+        with open(model_hist, newline="") as f:
+            for row in _csv.DictReader(f):
+                date = row.get("date", "")
+                try:
+                    auc = float(row.get("avg_auc", row.get("auc", 0)))
+                except Exception:
+                    continue
+                auc_by_date.setdefault(date, []).append(auc)
+        for date in sorted(auc_by_date):
+            vals = auc_by_date[date]
+            out["auc_series"].append({
+                "date": date,
+                "avg_auc": round(sum(vals) / len(vals), 4),
+                "best_auc": round(max(vals), 4),
+                "worst_auc": round(min(vals), 4),
+                "above_065": sum(1 for a in vals if a >= 0.65),
+            })
+    return out
+
 # ══════════════════════════════════════════════════════════════════════
 #  SPA fallback — serve React app for all non-API routes
 # ══════════════════════════════════════════════════════════════════════

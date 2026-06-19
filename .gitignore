@@ -44,3 +44,10 @@ mobile/ios/
 # Docker volumes
 redis_data/
 pg_data/
+
+bot.pid
+models/history/
+data/ticks/
+fix_training.py
+patch_*.py
+dedup_*.py

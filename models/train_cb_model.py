@@ -199,7 +199,7 @@ def build_features(candles_m1: pd.DataFrame, avg_ticks: int,
     return feat.replace([np.inf, -np.inf], 0).fillna(0)
 
 
-def build_labels(candles_m1: pd.DataFrame, horizon: int = SPIKE_HORIZON) -> pd.Series:
+def build_labels(candles_m1: pd.DataFrame, horizon: int = SPIKE_HORIZON, spike_mag: float = None) -> pd.Series:
     """
     Label each M1 candle: 1 if any of the next `horizon` candles has a
     high-low range exceeding 3x the current ATR — a movement-based spike label.
@@ -219,8 +219,9 @@ def build_labels(candles_m1: pd.DataFrame, horizon: int = SPIKE_HORIZON) -> pd.S
     labels       = np.zeros(n, dtype=np.int8)
 
     for i in range(n - horizon):
+        threshold = spike_mag * 0.50 if spike_mag is not None else 3.0 * atrs[i]
         for j in range(1, horizon + 1):
-            if i + j < n and candle_range[i + j] > 3.0 * atrs[i]:
+            if i + j < n and candle_range[i + j] > threshold:
                 labels[i] = 1
                 break
 
@@ -271,7 +272,7 @@ def walk_forward_train(X: np.ndarray, y: np.ndarray, n_folds: int = 5):
         pos_weight = max(1, (y_train == 0).sum() / max((y_train == 1).sum(), 1))
 
         model = XGBClassifier(
-            n_estimators       = 400,
+            n_estimators       = 600,
             max_depth          = 5,
             learning_rate      = 0.05,
             subsample          = 0.8,
@@ -286,6 +287,7 @@ def walk_forward_train(X: np.ndarray, y: np.ndarray, n_folds: int = 5):
             X_train_s, y_train,
             eval_set=[(X_test_s, y_test)],
             verbose=False,
+            early_stopping_rounds=30,
         )
 
         proba = model.predict_proba(X_test_s)[:, 1]
@@ -351,7 +353,7 @@ def train_symbol(symbol: str, csv_path: str = None, n_ticks: int = 100_000):
         tss_series = pd.Series(tss, index=m1.index)
 
     feats  = build_features(m1, cfg.avg_ticks_between_spikes, tss_series)
-    labels = build_labels(m1, SPIKE_HORIZON)
+    labels = build_labels(m1, SPIKE_HORIZON, spike_mag=cfg.typical_spike_magnitude)
 
     # Drop last SPIKE_HORIZON rows (labels are NaN/0 by construction)
     feats  = feats.iloc[:-SPIKE_HORIZON]

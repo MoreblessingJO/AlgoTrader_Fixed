@@ -12,6 +12,14 @@ echo "========================================" >> $LOG
 echo "Daily retrain started: $(date -u)" >> $LOG
 echo "========================================" >> $LOG
 
+# Abort if disk is over 95% full
+DISK_PCT=$(df / | awk 'NR==2 {gsub("%","",$5); print $5}')
+if [ "$DISK_PCT" -ge 95 ]; then
+    echo "ABORT: Disk ${DISK_PCT}% full — skipping retrain to protect system" >> $LOG
+    exit 1
+fi
+echo "Disk usage: ${DISK_PCT}%" >> $LOG
+
 # Count how many ticks we have per symbol
 for f in data/ticks/*_ticks.csv; do
     rows=$(wc -l < "$f" 2>/dev/null || echo 0)
@@ -27,13 +35,14 @@ echo "Retrain done: $(date -u)" >> $LOG
 python3 models/snapshot_performance.py >> $LOG 2>&1
 echo "Performance snapshot saved: $(date -u)" >> $LOG
 
-# Restart bot to load new models (cron has no SSH session so pkill is safe here)
-BOT_PID=$(pgrep -f "python3 bot.py" | head -1)
-if [ -n "$BOT_PID" ]; then
-    kill $BOT_PID 2>/dev/null || true
-    echo "Stopped bot PID $BOT_PID" >> $LOG
-fi
+# Restart bot — kill ALL instances to prevent accumulation of ghost processes
+echo "Stopping all bot instances..." >> $LOG
+BOT_PID=$(pgrep -f "python3.*bot\.py" | head -1)
+if [ -n "$BOT_PID" ]; then kill "$BOT_PID"; sleep 3; fi
+pkill -f "python3.*bot\.py" 2>/dev/null || true
 sleep 3
+rm -f /root/algotrader_fixed/bot.pid
+
 setsid python3 bot.py --paper >> logs/bot.log 2>&1 </dev/null &
 disown
 

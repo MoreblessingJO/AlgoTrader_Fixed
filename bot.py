@@ -48,11 +48,16 @@ from api.server import app as _api_app, inject_bot
 from models.cb_predictor import CBPredictorPool
 
 # ── Logging ───────────────────────────────────────────────────────────
+import logging.handlers as _lh
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     handlers=[
-        logging.FileHandler("logs/bot.log"),
+        _lh.RotatingFileHandler(
+            "logs/bot.log",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+        ),
     ],
 )
 log = logging.getLogger("Bot")
@@ -816,6 +821,22 @@ class TradingBot:
 # ══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    # Single-instance guard
+    _PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.pid")
+    def _pid_alive(p):
+        if not os.path.exists(p): return False
+        try:
+            with open(p) as _f: pid = int(_f.read().strip())
+            os.kill(pid, 0); return True
+        except (ValueError, OSError): return False
+    if _pid_alive(_PID_FILE):
+        print("Another bot.py is running. Exiting."); import sys; sys.exit(1)
+    open(_PID_FILE, "w").write(str(os.getpid()))
+    import atexit; atexit.register(lambda: os.path.exists(_PID_FILE) and os.remove(_PID_FILE))
+
+    # ── Single-instance guard ─────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────
+
     parser = argparse.ArgumentParser(description="Autonomous Trading Bot")
     parser.add_argument("--paper", action="store_true", help="Force paper mode")
     parser.add_argument("--live",  action="store_true", help="Force live mode")
